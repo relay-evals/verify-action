@@ -1,0 +1,234 @@
+# relayevals/verify-action@v1
+#
+# The merge gate, as a workflow step.
+#
+# A COMPOSITE ACTION, not a JavaScript one, and that is a security decision as
+# much as a convenience. A JS action ships a bundled `dist/index.js` — tens of
+# thousands of lines of vendored dependencies committed to a repository, which
+# every consumer runs with their OIDC token in scope and almost nobody reads.
+# This runs the published CLI and nothing else, so what executes in your job is
+# the same artifact you can download, checksum, and build from source.
+#
+# WHAT IT DOES, in order:
+#   1. installs the CLI at a pinned version
+#   2. exchanges this job's OIDC token for a 15-minute signing credential
+#   3. configures the repository to use it
+#   4. verifies the changed lines against the receipts present
+#   5. checks whether the changed tests would fail without the change
+#   6. reports counts and codes to the dashboard
+#   7. exits with the verdict, so branch protection can act on it
+#
+# The private key is generated inside the job and never leaves it. There is no
+# secret to add to the repository, which is the entire point.
+
+name: "Relay verify"
+description: "Block a pull request whose changed lines have no verified evidence."
+author: "Relay"
+
+branding:
+  icon: "check-circle"
+  color: "gray-dark"
+
+inputs:
+  version:
+    description: "CLI version to install. Pin this."
+    required: false
+    default: "0.6.39"
+  server:
+    description: "Relay server."
+    required: false
+    default: "https://relayevals.com"
+  working-directory:
+    description: "Directory to verify. Defaults to the workspace root."
+    required: false
+    default: "."
+  fail-on-verdict:
+    description: >-
+      Whether a BLOCK or UNRESOLVED verdict fails the job. Set false to observe
+      the gate before enforcing it — the recommended way to adopt it.
+    required: false
+    default: "true"
+  red-first:
+    description: >-
+      Whether to check that the changed tests would fail without the change.
+      REQUIRES fetch-depth: 0 on actions/checkout — the check needs the merge
+      base with your target branch, and the default shallow clone has no common
+      ancestor to compare against. Without it the check reports inconclusive
+      and says so; it never guesses.
+    required: false
+    default: "true"
+  fail-on-vacuous-tests:
+    description: >-
+      Whether tests that pass without the change fail the job. Defaults to
+      FALSE: this is a new and stricter measurement, and a check that reddens
+      builds the day it is installed gets removed before it ever catches
+      anything. Watch it for a week, then turn it on.
+    required: false
+    default: "false"
+
+outputs:
+  verdict:
+    description: "PASS, BLOCK, UNRESOLVED or POLICY_DRIFT."
+    value: ${{ steps.gate.outputs.verdict }}
+  changed-total:
+    description: "Changed surfaces considered."
+    value: ${{ steps.gate.outputs.changed-total }}
+  changed-verified:
+    description: "Of those, how many some receipt covers."
+    value: ${{ steps.gate.outputs.changed-verified }}
+  red-first:
+    description: "genuine, vacuous, inconclusive, or skipped."
+    value: ${{ steps.redfirst.outputs.outcome }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check the OIDC permission before doing any work
+      shell: bash
+      run: |
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::error title=Missing permission::This job cannot request an OIDC token."
+          echo ""
+          echo "Add this to the workflow or the job:"
+          echo ""
+          echo "    permissions:"
+          echo "      id-token: write"
+          echo "      contents: read"
+          echo ""
+          echo "Relay needs it to obtain a signing credential. There is no secret to add."
+          exit 1
+        fi
+
+    - name: Install the CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        # THE VERSIONED INSTALLER, not the live one.
+        #
+        # This used to fetch /install.sh — whatever that URL serves at the
+        # moment the job runs — and then set RELAY_VERSION, which install.sh
+        # has never read. So `version:` pinned nothing at all: every run
+        # installed the current release, and a workflow that said 0.6.3 got
+        # whatever had shipped since. The comment here claimed the opposite.
+        #
+        # /releases/<version>/install.sh is the exact installer published with
+        # that release. It carries its own VERSION, tarball URL and tarball
+        # sha256 as literals, so pinning the installer pins every artifact
+        # beneath it. A version that was never published 404s here rather than
+        # silently installing a different one.
+        curl -fsSL "${{ inputs.server }}/releases/${{ inputs.version }}/install.sh" \
+          -o /tmp/relay-install.sh
+        bash /tmp/relay-install.sh
+
+    - name: Obtain a signing credential
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: relayevals ci auth --server "${{ inputs.server }}"
+
+    - name: Configure this repository
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        CREDS="${RUNNER_TEMP}/relay-ci"
+        relayevals setup --profile ci --non-interactive \
+          --producer-key "@${CREDS}/producer.pem" \
+          --authority-public-key "@${CREDS}/authority.pem"
+
+    - name: Verify the changed lines
+      id: gate
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -uo pipefail
+        # `verdict` exits non-zero on BLOCK, which is the point — but the
+        # reporting step below must still run, so the exit code is captured
+        # rather than allowed to end the job here.
+        relayevals verdict --format json > "${RUNNER_TEMP}/relay-verdict.json" || true
+        VERDICT=$(node -e 'const a=require(process.env.F);console.log(a.verdict??"UNRESOLVED")' 2>/dev/null || echo UNRESOLVED)
+        echo "verdict=${VERDICT}" >> "$GITHUB_OUTPUT"
+        echo "### Relay: ${VERDICT}" >> "$GITHUB_STEP_SUMMARY"
+      env:
+        F: ${{ runner.temp }}/relay-verdict.json
+
+    - name: Do the changed tests depend on the change?
+      id: redfirst
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      # NEVER fails the job here, whatever the outcome. Enforcement is a
+      # separate, explicit decision below — this step's only job is to measure
+      # and record, so that turning enforcement on later changes nothing about
+      # what was measured.
+      run: |
+        set -uo pipefail
+        if [ "${{ inputs.red-first }}" != "true" ]; then
+          echo "outcome=skipped" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        # The pull request's "before" is the merge base with its TARGET branch.
+        # On a pull_request event GITHUB_BASE_REF names it; origin/ is where
+        # checkout puts it. On a push there is no target branch, so detection
+        # falls back to the tracked upstream and then to main.
+        BASE=""
+        if [ -n "${GITHUB_BASE_REF:-}" ]; then BASE="--base origin/${GITHUB_BASE_REF}"; fi
+        relayevals red-first $BASE --format json > "${RUNNER_TEMP}/relay-red-first.json" || true
+        OUTCOME=$(node -e 'const r=require(process.env.F);console.log(r.outcome??"inconclusive")' 2>/dev/null || echo inconclusive)
+        REASON=$(node -e 'const r=require(process.env.F);console.log(r.reason??"")' 2>/dev/null || echo "")
+        echo "outcome=${OUTCOME}" >> "$GITHUB_OUTPUT"
+        if [ "$OUTCOME" = "vacuous" ]; then
+          echo "### Relay red-first: your tests pass without your change" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "${REASON}" >> "$GITHUB_STEP_SUMMARY"
+        elif [ "$OUTCOME" = "genuine" ]; then
+          echo "### Relay red-first: the changed tests depend on the change" >> "$GITHUB_STEP_SUMMARY"
+        else
+          # An inconclusive check SAYS SO. Printing nothing would let a
+          # workflow believe the check ran and cleared the change.
+          echo "### Relay red-first: not measured — ${REASON}" >> "$GITHUB_STEP_SUMMARY"
+        fi
+      env:
+        F: ${{ runner.temp }}/relay-red-first.json
+
+    - name: Report to the dashboard
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      # Never fails the job. The decision was made offline and has already been
+      # printed; losing a dashboard row must not turn a passing build red, or
+      # an outage of ours becomes an outage of yours.
+      continue-on-error: true
+      run: |
+        RF=""
+        if [ -f "${RUNNER_TEMP}/relay-red-first.json" ]; then
+          RF="--red-first-file ${RUNNER_TEMP}/relay-red-first.json"
+        fi
+        relayevals ci report \
+          --server "${{ inputs.server }}" \
+          --verdict-file "${RUNNER_TEMP}/relay-verdict.json" \
+          $RF
+
+    - name: Enforce the verdict
+      shell: bash
+      run: |
+        # Red-first is enforced BEFORE the verdict is allowed to pass, and only
+        # when explicitly turned on. A PASS whose tests prove nothing is the
+        # exact failure this measurement exists to name, so letting the verdict
+        # short-circuit it would leave the hole open on the surface that was
+        # supposed to close it.
+        if [ "${{ steps.redfirst.outputs.outcome }}" = "vacuous" ]; then
+          if [ "${{ inputs.fail-on-vacuous-tests }}" = "true" ]; then
+            echo "::error title=Relay red-first::Your tests pass with the change reverted. They executed the changed lines without checking them."
+            exit 1
+          fi
+          echo "::warning title=Relay red-first::Your tests pass with the change reverted. Observed, not enforced."
+        fi
+        VERDICT="${{ steps.gate.outputs.verdict }}"
+        if [ "$VERDICT" = "PASS" ]; then
+          echo "Relay: PASS — every changed line has verified evidence."
+          exit 0
+        fi
+        if [ "${{ inputs.fail-on-verdict }}" != "true" ]; then
+          echo "::warning title=Relay ${VERDICT}::Observed, not enforced (fail-on-verdict is false)."
+          exit 0
+        fi
+        echo "::error title=Relay ${VERDICT}::Changed lines without verified evidence cannot merge."
+        exit 1
