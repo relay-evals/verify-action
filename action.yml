@@ -33,7 +33,7 @@ inputs:
   version:
     description: "CLI version to install. Pin this."
     required: false
-    default: "0.6.59"
+    default: "0.6.60"
   server:
     description: "Relay server."
     required: false
